@@ -1,0 +1,14 @@
+[
+  {
+    "productID": "001",
+    "threshold": 200,
+    "windowSeconds": 300,
+    "ttlSeconds": 300
+  },
+  {
+    "productID": "002",
+    "threshold": 50,
+    "windowSeconds": 60,
+    "ttlSeconds": 120
+  }
+]

@@ -1,0 +1,196 @@
+package com.example.alerting;
+
+import com.example.alerting.models.AlertTriggered;
+import com.example.alerting.models.ItemRecord;
+import com.example.alerting.models.OrderEvent;
+import com.example.alerting.models.Rule;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.serialization.SimpleStringSchema;
+import org.apache.flink.api.common.state.ListState;
+import org.apache.flink.api.common.state.ListStateDescriptor;
+import org.apache.flink.api.common.state.MapStateDescriptor;
+import org.apache.flink.api.common.state.StateTtlConfig;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
+import org.apache.flink.api.common.time.Time;
+import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.connector.kafka.source.KafkaSource;
+import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
+import org.apache.flink.connector.kafka.sink.KafkaSink;
+import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
+import org.apache.flink.streaming.api.datastream.BroadcastStream;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.co.KeyedBroadcastProcessFunction;
+import org.apache.flink.util.Collector;
+
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+
+public class AlertingJob {
+
+    private static final ObjectMapper mapper = new ObjectMapper();
+
+    public static void main(String[] args) throws Exception {
+        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        String brokers = System.getenv("KAFKA_BOOTSTRAP_SERVERS");
+        if (brokers == null || brokers.isEmpty()) {
+            brokers = "kafka:29092";
+        }
+
+        // 1. Rule Source
+        KafkaSource<String> ruleSource = KafkaSource.<String>builder()
+                .setBootstrapServers(brokers)
+                .setTopics("rule-stream-topic")
+                .setGroupId("flink-rule-group")
+                .setStartingOffsets(OffsetsInitializer.earliest())
+                .setValueOnlyDeserializer(new SimpleStringSchema())
+                .build();
+
+        DataStream<Rule> ruleStream = env
+                .fromSource(ruleSource, WatermarkStrategy.noWatermarks(), "Rule Source")
+                .map(json -> mapper.readValue(json, Rule.class))
+                .returns(Rule.class);
+
+        // 2. Order Source
+        KafkaSource<String> orderSource = KafkaSource.<String>builder()
+                .setBootstrapServers(brokers)
+                .setTopics("raw-orders-topic")
+                .setGroupId("flink-order-group")
+                .setStartingOffsets(OffsetsInitializer.latest())
+                .setValueOnlyDeserializer(new SimpleStringSchema())
+                .build();
+
+        DataStream<OrderEvent> orderStream = env
+                .fromSource(orderSource, WatermarkStrategy.noWatermarks(), "Order Source")
+                .map(json -> mapper.readValue(json, OrderEvent.class))
+                .returns(OrderEvent.class);
+
+        // 3. Broadcast State Descriptor
+        MapStateDescriptor<String, Rule> ruleStateDescriptor = new MapStateDescriptor<>(
+                "RulesBroadcastState",
+                BasicTypeInfo.STRING_TYPE_INFO,
+                TypeInformation.of(Rule.class)
+        );
+
+        BroadcastStream<Rule> broadcastRules = ruleStream.broadcast(ruleStateDescriptor);
+
+        // 4. Fan-out and Keying
+        DataStream<ItemRecord> itemStream = orderStream
+                .flatMap((OrderEvent order, Collector<ItemRecord> out) -> {
+                    if (order.items != null) {
+                        for (OrderEvent.Item item : order.items) {
+                            out.collect(new ItemRecord(item.productId, order.timestamp, item.quantity));
+                        }
+                    }
+                })
+                .returns(ItemRecord.class);
+
+        DataStream<AlertTriggered> alerts = itemStream
+                .keyBy(item -> item.productId)
+                .connect(broadcastRules)
+                .process(new DynamicAlertFunction(ruleStateDescriptor));
+
+        // 5. Alert Sink
+        KafkaSink<String> alertSink = KafkaSink.<String>builder()
+                .setBootstrapServers(brokers)
+                .setRecordSerializer(KafkaRecordSerializationSchema.builder()
+                        .setTopic("triggered-alerts-topic")
+                        .setValueSerializationSchema(new SimpleStringSchema())
+                        .build()
+                )
+                .build();
+
+        alerts
+                .map(alert -> mapper.writeValueAsString(alert))
+                .sinkTo(alertSink);
+
+        env.execute("Dynamic Alerting Engine");
+    }
+
+    public static class DynamicAlertFunction extends KeyedBroadcastProcessFunction<String, ItemRecord, Rule, AlertTriggered> {
+
+        private final MapStateDescriptor<String, Rule> ruleStateDescriptor;
+
+        // State to keep track of event items for the window
+        private transient ListState<ItemRecord> windowItems;
+        // State to keep track of the last time we emitted an alert for this key
+        private transient ValueState<Long> lastEmittedTime;
+
+        public DynamicAlertFunction(MapStateDescriptor<String, Rule> ruleStateDescriptor) {
+            this.ruleStateDescriptor = ruleStateDescriptor;
+        }
+
+        @Override
+        public void open(Configuration parameters) throws Exception {
+            StateTtlConfig ttlConfig = StateTtlConfig
+                    .newBuilder(Time.hours(12))
+                    .setUpdateType(StateTtlConfig.UpdateType.OnReadAndWrite)
+                    .setStateVisibility(StateTtlConfig.StateVisibility.NeverReturnExpired)
+                    .build();
+
+            ListStateDescriptor<ItemRecord> tsDescriptor = new ListStateDescriptor<>("windowItems", ItemRecord.class);
+            tsDescriptor.enableTimeToLive(ttlConfig);
+            windowItems = getRuntimeContext().getListState(tsDescriptor);
+
+            ValueStateDescriptor<Long> emittedTimeDescriptor = new ValueStateDescriptor<>("lastEmittedTime", Long.class);
+            emittedTimeDescriptor.enableTimeToLive(ttlConfig);
+            lastEmittedTime = getRuntimeContext().getState(emittedTimeDescriptor);
+        }
+
+        @Override
+        public void processElement(ItemRecord itemRecord, ReadOnlyContext ctx, Collector<AlertTriggered> out) throws Exception {
+            // Get the rule for this product
+            Rule rule = ctx.getBroadcastState(ruleStateDescriptor).get(itemRecord.productId);
+            if (rule == null) {
+                return; // No rule defined for this product, ignore
+            }
+
+            // Extract event time from payload
+            long eventTime = itemRecord.timestamp;
+            windowItems.add(itemRecord);
+
+            // Clean up old events outside the dynamic window
+            long windowStart = eventTime - (rule.windowSeconds * 1000L);
+            Iterator<ItemRecord> iterator = windowItems.get().iterator();
+            List<ItemRecord> retainedItems = new ArrayList<>();
+            int currentQuantitySum = 0;
+
+            while (iterator.hasNext()) {
+                ItemRecord rec = iterator.next();
+                if (rec.timestamp >= windowStart) {
+                    retainedItems.add(rec);
+                    currentQuantitySum += rec.quantity;
+                }
+            }
+
+            // Update state with retained items
+            windowItems.update(retainedItems);
+
+            // Rate-Limited Continuous Trigger Logic
+            if (currentQuantitySum >= rule.threshold) {
+                Long lastEmitted = lastEmittedTime.value();
+                long requiredCooldownMs = (rule.ttlSeconds * 1000L) / 2;
+
+                if (lastEmitted == null || (eventTime - lastEmitted) >= requiredCooldownMs) {
+                    // Emit alert
+                    out.collect(new AlertTriggered(itemRecord.productId, rule.ttlSeconds, currentQuantitySum));
+                    
+                    // Update last emitted time
+                    lastEmittedTime.update(eventTime);
+                }
+            }
+        }
+
+        @Override
+        public void processBroadcastElement(Rule rule, Context ctx, Collector<AlertTriggered> out) throws Exception {
+            // Update the broadcast state with the new rule
+            ctx.getBroadcastState(ruleStateDescriptor).put(rule.productID, rule);
+        }
+    }
+}
