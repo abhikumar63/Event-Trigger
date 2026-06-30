@@ -2,10 +2,12 @@ package com.example.alerting;
 
 import com.example.alerting.models.AlertTriggered;
 import com.example.alerting.models.ItemRecord;
-import com.example.alerting.models.OrderEvent;
 import com.example.alerting.models.Rule;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.confluent.kafka.serializers.KafkaAvroDeserializer;
+import org.apache.avro.generic.GenericRecord;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.serialization.AbstractDeserializationSchema;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
@@ -17,23 +19,33 @@ import org.apache.flink.api.common.time.Time;
 import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
+import org.apache.flink.connector.kafka.sink.KafkaSink;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
-import org.apache.flink.connector.kafka.sink.KafkaSink;
-import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
 import org.apache.flink.streaming.api.datastream.BroadcastStream;
 import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.ProcessFunction;
 import org.apache.flink.streaming.api.functions.co.KeyedBroadcastProcessFunction;
 import org.apache.flink.util.Collector;
+import org.apache.flink.util.OutputTag;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 
 public class AlertingJob {
 
     private static final ObjectMapper mapper = new ObjectMapper();
+    private static final Logger LOG = LoggerFactory.getLogger(AlertingJob.class);
 
     public static void main(String[] args) throws Exception {
         final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
@@ -42,6 +54,9 @@ public class AlertingJob {
         if (brokers == null || brokers.isEmpty()) {
             brokers = "kafka:29092";
         }
+
+        // Output Tag for DLQ
+        final OutputTag<String> dlqTag = new OutputTag<String>("dlq-orders-topic"){};
 
         // 1. Rule Source
         KafkaSource<String> ruleSource = KafkaSource.<String>builder()
@@ -57,19 +72,22 @@ public class AlertingJob {
                 .map(json -> mapper.readValue(json, Rule.class))
                 .returns(Rule.class);
 
-        // 2. Order Source
-        KafkaSource<String> orderSource = KafkaSource.<String>builder()
+        // 2. Order Source (Raw Bytes)
+        KafkaSource<byte[]> orderSource = KafkaSource.<byte[]>builder()
                 .setBootstrapServers(brokers)
                 .setTopics("raw-orders-topic")
                 .setGroupId("flink-order-group")
                 .setStartingOffsets(OffsetsInitializer.latest())
-                .setValueOnlyDeserializer(new SimpleStringSchema())
+                .setValueOnlyDeserializer(new AbstractDeserializationSchema<byte[]>() {
+                    @Override
+                    public byte[] deserialize(byte[] message) throws IOException {
+                        return message;
+                    }
+                })
                 .build();
 
-        DataStream<OrderEvent> orderStream = env
-                .fromSource(orderSource, WatermarkStrategy.noWatermarks(), "Order Source")
-                .map(json -> mapper.readValue(json, OrderEvent.class))
-                .returns(OrderEvent.class);
+        DataStream<byte[]> rawOrderStream = env
+                .fromSource(orderSource, WatermarkStrategy.noWatermarks(), "Order Source");
 
         // 3. Broadcast State Descriptor
         MapStateDescriptor<String, Rule> ruleStateDescriptor = new MapStateDescriptor<>(
@@ -80,23 +98,69 @@ public class AlertingJob {
 
         BroadcastStream<Rule> broadcastRules = ruleStream.broadcast(ruleStateDescriptor);
 
-        // 4. Fan-out and Keying
-        DataStream<ItemRecord> itemStream = orderStream
-                .flatMap((OrderEvent order, Collector<ItemRecord> out) -> {
-                    if (order.items != null) {
-                        for (OrderEvent.Item item : order.items) {
-                            out.collect(new ItemRecord(item.productId, order.timestamp, item.quantity));
+        // 4. Deserialization & Fan-out with DLQ (ProcessFunction)
+        SingleOutputStreamOperator<ItemRecord> itemStream = rawOrderStream
+                .process(new ProcessFunction<byte[], ItemRecord>() {
+                    private transient KafkaAvroDeserializer deserializer;
+
+                    @Override
+                    public void open(Configuration parameters) throws Exception {
+                        deserializer = new KafkaAvroDeserializer();
+                        Map<String, Object> config = new HashMap<>();
+                        
+                        String schemaRegistryUrl = System.getenv("SCHEMA_REGISTRY_URL");
+                        if (schemaRegistryUrl == null || schemaRegistryUrl.isEmpty()) {
+                            schemaRegistryUrl = "http://schema-registry:8081";
+                        }
+                        
+                        config.put("schema.registry.url", schemaRegistryUrl);
+                        deserializer.configure(config, false);
+                    }
+
+                    @Override
+                    public void processElement(byte[] value, Context ctx, Collector<ItemRecord> out) throws Exception {
+                        try {
+                            GenericRecord record = (GenericRecord) deserializer.deserialize("raw-orders-topic", value);
+                            
+                            Long timestamp = (Long) record.get("timestamp");
+                            Object itemsObj = record.get("items");
+                            
+                            if (itemsObj instanceof Iterable) {
+                                for (Object itemObj : (Iterable<?>) itemsObj) {
+                                    GenericRecord item = (GenericRecord) itemObj;
+                                    String productId = item.get("productId").toString();
+                                    int quantity = (Integer) item.get("quantity");
+                                    out.collect(new ItemRecord(productId, timestamp, quantity));
+                                }
+                            }
+                        } catch (Exception e) {
+                            String base64Garbage = Base64.getEncoder().encodeToString(value);
+                            LOG.warn("[DLQ CAUGHT POISON PILL] Failed to deserialize Avro payload: {}", e.getMessage());
+                            ctx.output(dlqTag, base64Garbage);
                         }
                     }
                 })
                 .returns(ItemRecord.class);
 
+        // 5. DLQ Sink
+        DataStream<String> dlqStream = itemStream.getSideOutput(dlqTag);
+        KafkaSink<String> dlqSink = KafkaSink.<String>builder()
+                .setBootstrapServers(brokers)
+                .setRecordSerializer(KafkaRecordSerializationSchema.builder()
+                        .setTopic("dlq-orders-topic")
+                        .setValueSerializationSchema(new SimpleStringSchema())
+                        .build()
+                )
+                .build();
+        dlqStream.sinkTo(dlqSink);
+
+        // 6. Main Flow: Connect Streams and Process Alerts
         DataStream<AlertTriggered> alerts = itemStream
                 .keyBy(item -> item.productId)
                 .connect(broadcastRules)
                 .process(new DynamicAlertFunction(ruleStateDescriptor));
 
-        // 5. Alert Sink
+        // 7. Alert Sink
         KafkaSink<String> alertSink = KafkaSink.<String>builder()
                 .setBootstrapServers(brokers)
                 .setRecordSerializer(KafkaRecordSerializationSchema.builder()
@@ -117,9 +181,7 @@ public class AlertingJob {
 
         private final MapStateDescriptor<String, Rule> ruleStateDescriptor;
 
-        // State to keep track of event items for the window
         private transient ListState<ItemRecord> windowItems;
-        // State to keep track of the last time we emitted an alert for this key
         private transient ValueState<Long> lastEmittedTime;
 
         public DynamicAlertFunction(MapStateDescriptor<String, Rule> ruleStateDescriptor) {
@@ -145,17 +207,14 @@ public class AlertingJob {
 
         @Override
         public void processElement(ItemRecord itemRecord, ReadOnlyContext ctx, Collector<AlertTriggered> out) throws Exception {
-            // Get the rule for this product
             Rule rule = ctx.getBroadcastState(ruleStateDescriptor).get(itemRecord.productId);
             if (rule == null) {
-                return; // No rule defined for this product, ignore
+                return; 
             }
 
-            // Extract event time from payload
             long eventTime = itemRecord.timestamp;
             windowItems.add(itemRecord);
 
-            // Clean up old events outside the dynamic window
             long windowStart = eventTime - (rule.windowSeconds * 1000L);
             Iterator<ItemRecord> iterator = windowItems.get().iterator();
             List<ItemRecord> retainedItems = new ArrayList<>();
@@ -169,19 +228,14 @@ public class AlertingJob {
                 }
             }
 
-            // Update state with retained items
             windowItems.update(retainedItems);
 
-            // Rate-Limited Continuous Trigger Logic
             if (currentQuantitySum >= rule.threshold) {
                 Long lastEmitted = lastEmittedTime.value();
                 long requiredCooldownMs = (rule.ttlSeconds * 1000L) / 2;
 
                 if (lastEmitted == null || (eventTime - lastEmitted) >= requiredCooldownMs) {
-                    // Emit alert
                     out.collect(new AlertTriggered(itemRecord.productId, rule.ttlSeconds, currentQuantitySum));
-                    
-                    // Update last emitted time
                     lastEmittedTime.update(eventTime);
                 }
             }
@@ -189,7 +243,6 @@ public class AlertingJob {
 
         @Override
         public void processBroadcastElement(Rule rule, Context ctx, Collector<AlertTriggered> out) throws Exception {
-            // Update the broadcast state with the new rule
             ctx.getBroadcastState(ruleStateDescriptor).put(rule.productID, rule);
         }
     }

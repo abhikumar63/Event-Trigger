@@ -1,0 +1,35 @@
+{
+  "type": "record",
+  "name": "OrderEvent",
+  "namespace": "com.example.alerting.models",
+  "fields": [
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "timestamp",
+      "type": "long"
+    },
+    {
+      "name": "items",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "Item",
+          "fields": [
+            {
+              "name": "productId",
+              "type": "string"
+            },
+            {
+              "name": "quantity",
+              "type": "int"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

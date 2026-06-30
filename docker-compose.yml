@@ -60,6 +60,17 @@ services:
       timeout: 3s
       retries: 5
 
+  schema-registry:
+    image: confluentinc/cp-schema-registry:latest
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8082:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+
   jobmanager:
     build:
       context: .
@@ -71,6 +82,7 @@ services:
       - |
         FLINK_PROPERTIES=
         jobmanager.rpc.address: jobmanager
+      - SCHEMA_REGISTRY_URL=http://schema-registry:8081
     volumes:
       - ./flink-log4j-console.properties:/opt/flink/conf/log4j-console.properties
     healthcheck:
@@ -92,6 +104,7 @@ services:
         FLINK_PROPERTIES=
         jobmanager.rpc.address: jobmanager
         taskmanager.numberOfTaskSlots: 2
+      - SCHEMA_REGISTRY_URL=http://schema-registry:8081
     volumes:
       - ./flink-log4j-console.properties:/opt/flink/conf/log4j-console.properties
 
@@ -113,8 +126,13 @@ services:
         condition: service_healthy
       rule-producer:
         condition: service_started
+      schema-registry:
+        condition: service_started
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - SCHEMA_REGISTRY_URL=http://schema-registry:8081
+    volumes:
+      - ./schema:/schema
     restart: on-failure
 
   redis-consumer:
@@ -139,6 +157,8 @@ services:
         condition: service_healthy
       kafka-setup:
         condition: service_completed_successfully
+      schema-registry:
+        condition: service_started
       jobmanager:
         condition: service_healthy
       taskmanager:
